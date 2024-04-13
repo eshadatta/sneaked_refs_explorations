@@ -1,56 +1,94 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.types import StringType, FloatType, StructField, StructType
+from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy.sparse import issparse
 import json 
 import sys
-from boto3  import client
-import itertools 
+import re
+from stopwordsiso import stopwords
+import calendar
+from datetime import datetime
 
 input = sys.argv[1]
 output = sys.argv[2]
 INPUT = input
 OUTPUT = output
-bucket_name = "outputs-private.research.crossref.org"
-prefix = "snapshot-jsonl/snapshot-24-02/"
 
-def get_results(s3_conn, cont_key = None):
-    if cont_key:
-        s3_result =  s3_conn.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter = "/", ContinuationToken=cont_key)
-    else:
-        s3_result =  s3_conn.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter = "/")
-    return s3_result
+def get_stopwords():
+    months = [x.lower() for x in list(calendar.month_name)[1:]]
+    eng_stopwords = stopwords('en')
+    domain_stopwords = ["book","review", "et al", "studies","journal","revue","conference", "annals","proceedings","advances","bulletin","société","del","acta","études","tijdschrift","voor","anales","журнал","zeitschrift","annales","archiv","archiv"]
+    all_stopwords = list(eng_stopwords) + list(stopwords('es')) + list(stopwords('de')) + list(stopwords('fr')) + list(stopwords('ru')) + domain_stopwords + months
+    return all_stopwords
 
-def get_files(results):
-    objects = []
-    for i in results:
-        is_file = i['Key'].split("/")[-1]
-        if is_file:
-            objects.append(i['Key'])
-    return objects
 
-def get_objects(conn, cont_key = None, file_list = []):
-    results = get_results(conn, cont_key)
-    latest_files = get_files(results['Contents'])
-    file_list.append(latest_files)
-    if 'NextContinuationToken' in results:
-        cont_key = results['NextContinuationToken']
-        get_objects(conn, cont_key, file_list) 
-    return file_list
+def clean_text(doi, text):
+    X = None
+    all_stopwords = get_stopwords()
+    clean_text = re.sub(r"doi\:.*?\s","",text[0])
+    clean_text = re.sub(r'<.*?>','',clean_text)
+    clean_text = re.sub(r"http.*?\s","",clean_text)
+    clean_text = re.sub(r"\d+", "",clean_text)
+    vectorizer = TfidfVectorizer(stop_words=all_stopwords)
+    try:
+        X = vectorizer.fit_transform([clean_text])
+    except Exception as e:
+        print(f"ERROR: {doi}. Exception: {e}")
+    return [X, vectorizer, clean_text]
+
+
+def get_highest_tf_idf_vocab(result_idf, vectorizer):
+    features = vectorizer.get_feature_names_out()
+    # converting from sparse matrix, to numpy array
+    # since there is only one document of all concatenated refs
+    # getting the values from the first index
+    ar_refs_idf = result_idf.toarray()[0]
+    highest_value = float(max(ar_refs_idf))
+    # getting all positions where the value is the highest value
+    position = np.where(ar_refs_idf == highest_value)[0]
+    # get vocabulary from features that match the position 
+    vocab = list(map(lambda x: features[x], position))
+    return {"vocabulary": vocab, "tf_idf_value": highest_value}
+
+def get_proc_refs_info(doi, refs):
+    refs1_info = {"DOI": doi, "vocabulary": None, "tf_idf_value": None}
+    refs = [r[:50] for r in refs]
+    process_refs = [" ".join(refs)]
+    has_chars = re.findall(r"\w{2,10}",process_refs[0])
+    match_ptge = (len(has_chars)/len(refs)) * 100
+    if match_ptge >= 30:
+        refs1_idf, vect1, cleaned1_txt = clean_text(doi, process_refs)
+        if issparse(refs1_idf):
+            tf_idf_values = get_highest_tf_idf_vocab(refs1_idf, vect1)
+            refs1_info.update(tf_idf_values)
+    return refs1_info
+
+def clean_refs(ref):
+    clean_text = re.sub(r"doi\:.*?\s","",ref)
+    clean_text = re.sub(r'<.*?>','',clean_text)
+    clean_text = re.sub(r"http.*?\s","",clean_text)
+    clean_text = re.sub(r"\d+", "",clean_text)
+    return clean_text
 
 def get_processable_references(reference):
     processable_references = []
     for x in reference:
-        if 'author' in x:
+        if 'unstructured' in x:
+            cleaned = clean_refs(x['unstructured'])
+            processable_references.append(cleaned)
+        elif 'author' in x:
             processable_references.append(x['author'])
-        elif 'unstructured' in x:
-            processable_references.append(x['unstructured'])
+    processable_references = list(filter(lambda x: re.findall(r'\w+',x), processable_references))
     processable_ref_count = len(processable_references)
     return processable_ref_count, processable_references
 
 def get_refs(contents):
     data = {}
     proc_ref_count, processable_refs = get_processable_references(contents['reference'])
-    processable_ref_count_percentage = round((proc_ref_count/contents['reference-count']) * 100)
-    if processable_ref_count_percentage >= 30:
-        data = {"DOI": contents['DOI'], "ref_count": contents['reference-count'], "proc_ref_ptge": processable_ref_count_percentage, "proc_refs": processable_refs}
+    if proc_ref_count >= 25:
+        processable_ref_count_percentage = round((proc_ref_count/contents['reference-count']) * 100)
+        if processable_ref_count_percentage >= 30:
+            data = {"DOI": contents['DOI'], "type": contents.get('type', None), "ref_count": contents['reference-count'], "proc_ref_ptge": processable_ref_count_percentage, "proc_refs": processable_refs}
     return data
 
 def process_record(contents):
@@ -62,21 +100,34 @@ def process_record(contents):
         data = get_refs(contents)
     return data
 
-s3_conn   = client('s3')
-files = get_objects(s3_conn)
-all_files = list(itertools.chain(*files))
-s3_uri = f"s3://{bucket_name}"
-full_s3_uris = list(map(lambda x: s3_uri + "/" + x, all_files))
-files_list = ",".join(full_s3_uris)
+def get_values(row):
+    doi = row['DOI']
+    refs = row['proc_refs']
+    v = get_proc_refs_info(doi, refs)
+    return v
+
+def get_sub_dir(OUTPUT):
+    now = datetime.now()
+    dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.min}_{now.second}"
+    return dir_name
 
 spark = SparkSession.builder \
             .config('spark.jars.packages', 'org.apache.hadoop:hadoop-aws:2.8.5') \
             .getOrCreate()
-all_data = spark.sparkContext.textFile("s3://specificfile.jsonl", minPartitions=1000)
-all_data = spark.sparkContext.textFile(files_list, minPartitions=1000)
+
+output_sub_dir = get_sub_dir(OUTPUT)
+statistics = f"{output_sub_dir}/counts.json"
+all_data = spark.sparkContext.textFile("s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/", minPartitions=1000)
 all_data = all_data.map(lambda r: json.loads(r))
 transformed_data = all_data.map(lambda d: process_record(d))
 transformed_data = transformed_data.filter(lambda d: d)
 transformed_data_df = spark.createDataFrame(transformed_data)
-transformed_data_df.write.parquet(OUTPUT)
-
+tf_idf_results = transformed_data.map(lambda r: get_values(r))
+tf_idf_results = tf_idf_results.filter(lambda r: r['tf_idf_value'] >= 0.5)
+schema = StructType([StructField("DOI", StringType(),False), StructField("vocabulary", StringType(),True), StructField("tf_idf_value", FloatType(),True)])
+tf_idf_dataframe = spark.createDataFrame(tf_idf_results, schema=schema)
+tf_idf_values = transformed_data_df.join(tf_idf_dataframe, 'DOI', "inner")
+sorted_tf_idf_values = tf_idf_values.sort("tf_idf_value")
+sorted_tf_idf_values = sorted_tf_idf_values.select("DOI", "vocabulary", "tf_idf_value")
+sorted_tf_idf_values.write.option("header", True).csv(output_sub_dir)
+tf_idf_values.write.format('json').save(f"{output_sub_dir}/all")

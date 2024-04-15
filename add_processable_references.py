@@ -2,12 +2,14 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, FloatType, StructField, StructType
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import issparse
+import numpy as np
 import json 
 import sys
 import re
 from stopwordsiso import stopwords
 import calendar
 from datetime import datetime
+import boto3
 
 input = sys.argv[1]
 output = sys.argv[2]
@@ -36,6 +38,16 @@ def clean_text(doi, text):
         print(f"ERROR: {doi}. Exception: {e}")
     return [X, vectorizer, clean_text]
 
+def write_statistics(data, path):
+    '''session = boto3.Session()
+    s3 = session.resource('s3')
+    obj = s3.Object(path)
+    obj.put(json.dumps(data))'''
+    try:
+        with open(path, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"ERROR writing: {e}")
 
 def get_highest_tf_idf_vocab(result_idf, vectorizer):
     features = vectorizer.get_feature_names_out()
@@ -108,7 +120,7 @@ def get_values(row):
 
 def get_sub_dir(OUTPUT):
     now = datetime.now()
-    dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.min}_{now.second}"
+    dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.minute}_{now.second}"
     return dir_name
 
 spark = SparkSession.builder \
@@ -119,15 +131,20 @@ output_sub_dir = get_sub_dir(OUTPUT)
 statistics = f"{output_sub_dir}/counts.json"
 all_data = spark.sparkContext.textFile("s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/", minPartitions=1000)
 all_data = all_data.map(lambda r: json.loads(r))
+all_data_count = all_data.count()
 transformed_data = all_data.map(lambda d: process_record(d))
 transformed_data = transformed_data.filter(lambda d: d)
+transformed_data_count = transformed_data.count()
 transformed_data_df = spark.createDataFrame(transformed_data)
 tf_idf_results = transformed_data.map(lambda r: get_values(r))
+tf_idf_results = tf_idf_results.filter(lambda r: r['tf_idf_value'])
 tf_idf_results = tf_idf_results.filter(lambda r: r['tf_idf_value'] >= 0.5)
+tf_idf_results_count = tf_idf_results.count()
+get_statistics = {"total_results_count": all_data_count, "number_of_unstructured_author_references_processed": transformed_data_count, "number_records_tf_idf_values": tf_idf_results_count}
 schema = StructType([StructField("DOI", StringType(),False), StructField("vocabulary", StringType(),True), StructField("tf_idf_value", FloatType(),True)])
 tf_idf_dataframe = spark.createDataFrame(tf_idf_results, schema=schema)
 tf_idf_values = transformed_data_df.join(tf_idf_dataframe, 'DOI', "inner")
-sorted_tf_idf_values = tf_idf_values.sort("tf_idf_value")
-sorted_tf_idf_values = sorted_tf_idf_values.select("DOI", "vocabulary", "tf_idf_value")
+sorted_tf_idf_values = tf_idf_values.filter(tf_idf_values.tf_idf_value >= 0.75).sort("tf_idf_value", ascending=False).select("DOI", "vocabulary", "tf_idf_value")
 sorted_tf_idf_values.write.option("header", True).csv(output_sub_dir)
 tf_idf_values.write.format('json').save(f"{output_sub_dir}/all")
+write_statistics(get_statistics, statistics)

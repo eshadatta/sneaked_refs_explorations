@@ -39,15 +39,11 @@ def clean_text(doi, text):
     return [X, vectorizer, clean_text]
 
 def write_statistics(data, path):
-    '''session = boto3.Session()
+    session = boto3.Session()
     s3 = session.resource('s3')
     obj = s3.Object(path)
-    obj.put(json.dumps(data))'''
-    try:
-        with open(path, 'w') as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"ERROR writing: {e}")
+    obj.put(json.dumps(data))
+
 
 def get_highest_tf_idf_vocab(result_idf, vectorizer):
     features = vectorizer.get_feature_names_out()

@@ -9,7 +9,7 @@ import re
 from stopwordsiso import stopwords
 import calendar
 from datetime import datetime
-import boto3
+
 
 input = sys.argv[1]
 output = sys.argv[2]
@@ -70,13 +70,6 @@ def clean_text(doi, text):
     except Exception as e:
         print(f"ERROR: {doi}. Exception: {e}")
     return [X, vectorizer, clean_text]
-
-
-def write_statistics(data, path):
-    session = boto3.Session()
-    s3 = session.resource("s3")
-    obj = s3.Object(path)
-    obj.put(json.dumps(data))
 
 
 def get_highest_tf_idf_vocab(result_idf, vectorizer):

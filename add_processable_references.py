@@ -195,5 +195,4 @@ schema = StructType(
     ]
 )
 tf_idf_dataframe = spark.createDataFrame(tf_idf_results, schema=schema)
-sorted_tf_idf_values = tf_idf_dataframe.sort("tf_idf_value", ascending=False)
-sorted_tf_idf_values.write.format("json").save(output_sub_dir)
+tf_idf_dataframe.write.format("json").save(output_sub_dir)

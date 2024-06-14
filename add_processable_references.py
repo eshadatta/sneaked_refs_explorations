@@ -1,7 +1,6 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StringType, FloatType, StructField, StructType
-from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.sparse import issparse
+from pyspark.sql.types import StringType, FloatType, IntegerType, StructField, StructType, ArrayType
+from sklearn.feature_extraction.text import CountVectorizer
 import numpy as np
 import json
 import sys
@@ -10,20 +9,42 @@ from stopwordsiso import stopwords
 import calendar
 from datetime import datetime
 
-
 input = sys.argv[1]
 output = sys.argv[2]
 INPUT = input
 OUTPUT = output
 
+def clean_refs(ref):
+    clean_text = re.sub(r"doi\:.*?\s", "", ref)
+    clean_text = re.sub(r"<.*?>", "", clean_text)
+    clean_text = re.sub(r"\&.*?\;", "", clean_text)
+    clean_text = re.sub(r"http.*?\s", "", clean_text)
+    clean_text = re.sub(r"\d+", "", clean_text)
+    clean_text = re.sub(r"_+", "", clean_text)
+    clean_text = re.sub(r"\.*?", "", clean_text)
+    clean_text = re.sub(r"\-.*?", "", clean_text)
+    clean_text = re.sub(r"[\[|\]]", "", clean_text)
+    return clean_text
 
 def get_stopwords():
     months = [x.lower() for x in list(calendar.month_name)[1:]]
     eng_stopwords = stopwords("en")
     domain_stopwords = [
         "book",
+        "last",
+        "em",
+        "accessed",
+        "phys",
+        "phd",
+        "colloq",
+        "univ",
+        "college",
+        "institute",
+        "arxiv",
+        "xxx",
         "review",
         "et al",
+        "etal",
         "studies",
         "journal",
         "revue",
@@ -43,85 +64,96 @@ def get_stopwords():
         "zeitschrift",
         "annales",
         "archiv",
-        "archiv",
+        "thesis",
+        "archive",
+        "cited",
+        "ref",
+        "vol",
+        "rev"
     ]
-    all_stopwords = (
-        list(eng_stopwords)
-        + list(stopwords("es"))
-        + list(stopwords("de"))
-        + list(stopwords("fr"))
-        + list(stopwords("ru"))
-        + domain_stopwords
-        + months
-    )
+    all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months
     return all_stopwords
 
-
-def clean_text(doi, text):
-    X = None
-    all_stopwords = get_stopwords()
-    clean_text = re.sub(r"doi\:.*?\s", "", text[0])
-    clean_text = re.sub(r"<.*?>", "", clean_text)
-    clean_text = re.sub(r"http.*?\s", "", clean_text)
-    clean_text = re.sub(r"\d+", "", clean_text)
-    vectorizer = TfidfVectorizer(stop_words=all_stopwords)
+def get_max_word(doi, words):
+    max_value = 0
+    keys = list(words.keys())
+    values = list(words.values())
     try:
-        X = vectorizer.fit_transform([clean_text])
-    except Exception as e:
-        print(f"ERROR: {doi}. Exception: {e}")
-    return [X, vectorizer, clean_text]
+        max_value = max(values)
+        indices = list(np.where(np.array(values) == max(values)))[0]
+        words = list(map(lambda x: keys[x], indices))
+    except ValueError as ve:
+        print(f"Error in max: for {doi}: word_dict: {words}. EXCEPTION : {ve.args[0]}")
+    return [max_value, words]
+    
+def get_tokens(doi, refs):
+    clean_text = {}
+    tokens = {}
+    all_tokens = []
+    split_by = r'\w{2,15}'
+    all_stopwords = get_stopwords() if 'unstructured' in refs.keys() else None
+    for ref_type, reference_values in refs.items():
+        tokens[ref_type] = []
+        clean_text[ref_type] = [clean_refs(x) for x in reference_values]
+        clean_text[ref_type] = [x for x in clean_text[ref_type] if re.findall(split_by,x)]
+        for text in clean_text[ref_type]:
+            tokens[ref_type].extend(re.findall(split_by, text))
+        if ref_type == "unstructured":
+            tokens[ref_type] = [t for t in tokens[ref_type] if t.lower() not in all_stopwords]
+    cleaned_ref_count = sum(map(len,clean_text.values()))
+    if tokens:
+        for v in tokens.values():
+            all_tokens.extend(v)
+    return [all_tokens, cleaned_ref_count]
 
-
-def get_highest_tf_idf_vocab(result_idf, vectorizer):
-    features = vectorizer.get_feature_names_out()
-    # converting from sparse matrix, to numpy array
-    # since there is only one document of all concatenated refs
-    # getting the values from the first index
-    ar_refs_idf = result_idf.toarray()[0]
-    highest_value = float(max(ar_refs_idf))
-    # getting all positions where the value is the highest value
-    position = np.where(ar_refs_idf == highest_value)[0]
-    # get vocabulary from features that match the position
-    vocab = list(map(lambda x: features[x], position))
-    return {"vocabulary": vocab, "tf_idf_value": highest_value}
-
+def count_tokens(doi, ref_length, tokens):
+    words = {}
+    for index, t in enumerate(tokens):
+        keys = list(words.keys())
+        if len(keys) == 0 or t not in keys:
+            first_count = index
+            words[t] = 1
+        elif (t in keys) and (index != first_count):
+            words[t] = words[t] + 1
+    [value, calculated_words] = get_max_word(doi, words)
+    frac_refs = value/ref_length
+    return {"token_vocabulary": calculated_words, "token_frac_refs": frac_refs, "cleaned_references_length": ref_length}
 
 def get_proc_refs_info(doi, refs):
-    refs1_info = {"DOI": doi, "vocabulary": None, "tf_idf_value": None}
-    refs = [r[:50] for r in refs]
-    process_refs = [" ".join(refs)]
-    has_chars = re.findall(r"\w{2,10}", process_refs[0])
-    match_ptge = (len(has_chars) / len(refs)) * 100
-    if match_ptge >= 30:
-        refs1_idf, vect1, cleaned1_txt = clean_text(doi, process_refs)
-        if issparse(refs1_idf):
-            tf_idf_values = get_highest_tf_idf_vocab(refs1_idf, vect1)
-            refs1_info.update(tf_idf_values)
-    return refs1_info
-
-
-def clean_refs(ref):
-    clean_text = re.sub(r"doi\:.*?\s", "", ref)
-    clean_text = re.sub(r"<.*?>", "", clean_text)
-    clean_text = re.sub(r"http.*?\s", "", clean_text)
-    clean_text = re.sub(r"\d+", "", clean_text)
-    return clean_text
-
+    total_ref_length = sum(map(len,refs.values()))
+    refs_info = {"DOI": doi, "token_vocabulary": None, "token_frac_refs": None,"total_processed_ref_len": total_ref_length, "cleaned_references_length": None}
+    [tokens, cleaned_ref_count] = get_tokens(doi, refs)
+    if tokens:
+        word_count_info = count_tokens(doi, cleaned_ref_count, tokens)
+        refs_info.update(word_count_info)
+    return refs_info
 
 def get_processable_references(reference):
-    processable_references = []
+    processable_references = {}
+    authors = []
+    unstructured = []
     for x in reference:
         if "unstructured" in x:
-            cleaned = clean_refs(x["unstructured"])
-            processable_references.append(cleaned)
+            # get the first 50 or fewer characters from unstructured
+            cleaned = clean_refs(x["unstructured"][:50])
+            unstructured.append(cleaned)
         elif "author" in x:
-            processable_references.append(x["author"])
-    processable_references = list(
-        filter(lambda x: re.findall(r"\w+", x), processable_references)
-    )
-    processable_ref_count = len(processable_references)
+            authors.append(x["author"])
+    if unstructured:
+        unstructured = list(filter(lambda x: re.findall(r"\w{2,15}", x), unstructured))
+        processable_references["unstructured"] = unstructured
+    if authors:
+        authors = list(
+            filter(lambda x: re.findall(r"\w{2,15}", x), authors))
+        processable_references["authors"] = authors
+    processable_ref_count = len(authors) + len(unstructured)
     return processable_ref_count, processable_references
 
+def get_authors(authors):
+    authors = list(filter(lambda x: x, authors))
+    authors = list(map(lambda x: x.lower(), authors))
+    authors = ", ".join(authors)
+    return authors
 
 def get_refs(contents):
     data = {}
@@ -131,15 +163,21 @@ def get_refs(contents):
             (proc_ref_count / contents["reference-count"]) * 100
         )
         if processable_ref_count_percentage >= 30:
+            title = contents['title'][0] if 'title' in contents else None
+            author = contents.get("author", None)
+            authors = None
+            if author:
+                authors = [get_authors([x.get('family', None), x.get('given', None)]) for x in author]
             data = {
                 "DOI": contents["DOI"],
                 "type": contents.get("type", None),
-                "ref_count": contents["reference-count"],
+                "author": authors,
+                "title": title,
+                "ref_count": contents.get("reference-count", None),
                 "proc_ref_ptge": processable_ref_count_percentage,
                 "proc_refs": processable_refs,
             }
     return data
-
 
 def process_record(contents):
     data = {}
@@ -150,11 +188,32 @@ def process_record(contents):
         data = get_refs(contents)
     return data
 
+def author_flag(doi, vocabulary, authors):
+    info = {"flag": "No"}
+    if isinstance(vocabulary, list):
+        process_authors = ",".join(authors)
+        tokenized_authors = process_authors.split(",")
+        tokenized_authors = [re.sub(r'\W', "", i) for i in tokenized_authors]
+        for i in vocabulary:
+            if i.lower() in tokenized_authors:
+                info["flag"] = "Yes"
+    else:
+        print(f"Unexpected vocabulary: {vocabulary} for DOI: {doi}")
+    return info
 
 def get_values(row):
     doi = row["DOI"]
     refs = row["proc_refs"]
     v = get_proc_refs_info(doi, refs)
+    v['work_type'] = row['type']
+    v['author'] = row['author']
+    v['title'] = row['title']
+    v['proc_refs'] = row['proc_refs']
+    v['flag'] = "No"
+    if v['author']:
+        tokens = v['token_vocabulary']
+        flag = author_flag(doi, tokens, v['author'])
+        v.update(flag)
     return v
 
 
@@ -169,23 +228,37 @@ spark = SparkSession.builder.config(
 ).getOrCreate()
 
 output_sub_dir = get_sub_dir(OUTPUT)
+
 all_data = spark.sparkContext.textFile(
     "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/",
     minPartitions=1000,
 )
+'''
+all_data = spark.sparkContext.textFile(
+    "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/part0.jsonl",
+    minPartitions=1000,
+)'''
 all_data = all_data.map(lambda r: json.loads(r))
 transformed_data = all_data.map(lambda d: process_record(d))
 transformed_data = transformed_data.filter(lambda d: d)
-tf_idf_results = transformed_data.map(lambda r: get_values(r))
-tf_idf_results = tf_idf_results.filter(
-    lambda r: r["tf_idf_value"] and r["tf_idf_value"] >= 0.75
+results = transformed_data.map(lambda r: get_values(r))
+results = results.filter(
+    lambda r: r["token_frac_refs"] and r["token_frac_refs"] >= 0.35
 )
+
 schema = StructType(
     [
         StructField("DOI", StringType(), False),
-        StructField("vocabulary", StringType(), True),
-        StructField("tf_idf_value", FloatType(), True),
+        StructField("token_vocabulary", ArrayType(StringType()), True),
+        StructField("token_frac_refs", FloatType(), True),
+        StructField("total_processed_ref_len", IntegerType(), True),
+        StructField("cleaned_references_length", IntegerType(), True),
+        StructField("work_type", StringType(), True),
+        StructField("author", ArrayType(StringType()), True),
+        StructField("flag", StringType(), True),
+        StructField("title", StringType(), True)
     ]
 )
-tf_idf_dataframe = spark.createDataFrame(tf_idf_results, schema=schema)
-tf_idf_dataframe.write.format("json").save(output_sub_dir)
+token_count_dataframe = spark.createDataFrame(results, schema=schema)
+parquet_filename = f"{output_sub_dir}.parquet"
+token_count_dataframe.write.parquet(parquet_filename)

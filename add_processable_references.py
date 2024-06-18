@@ -8,6 +8,8 @@ import re
 from stopwordsiso import stopwords
 import calendar
 from datetime import datetime
+from bs4 import BeautifulSoup
+import unicodedata
 
 input = sys.argv[1]
 output = sys.argv[2]
@@ -15,6 +17,7 @@ INPUT = input
 OUTPUT = output
 
 def clean_refs(ref):
+
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
     clean_text = re.sub(r"<.*?>", "", clean_text)
     clean_text = re.sub(r"\&.*?\;", "", clean_text)
@@ -24,6 +27,7 @@ def clean_refs(ref):
     clean_text = re.sub(r"\.*?", "", clean_text)
     clean_text = re.sub(r"\-.*?", "", clean_text)
     clean_text = re.sub(r"[\[|\]]", "", clean_text)
+    
     return clean_text
 
 def get_stopwords():
@@ -134,11 +138,13 @@ def get_processable_references(reference):
     unstructured = []
     for x in reference:
         if "unstructured" in x:
+            removed_html_ref = BeautifulSoup(x["unstructured"]).get_text()
             # get the first 50 or fewer characters from unstructured
-            cleaned = clean_refs(x["unstructured"][:50])
+            cleaned = clean_refs(removed_html_ref[:50])
             unstructured.append(cleaned)
         elif "author" in x:
-            authors.append(x["author"])
+            removed_html_author = BeautifulSoup(x["author"]).get_text()
+            authors.append(removed_html_author)
     if unstructured:
         unstructured = list(filter(lambda x: re.findall(r"\w{2,15}", x), unstructured))
         processable_references["unstructured"] = unstructured

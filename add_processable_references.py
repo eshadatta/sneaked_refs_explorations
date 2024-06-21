@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StringType, FloatType, IntegerType, StructField, StructType, ArrayType
+from pyspark.sql.types import StringType, FloatType, MapType, IntegerType, StructField, StructType, ArrayType
 from sklearn.feature_extraction.text import CountVectorizer
 import numpy as np
 import json
@@ -17,7 +17,6 @@ INPUT = input
 OUTPUT = output
 
 def clean_refs(ref):
-
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
     clean_text = re.sub(r"<.*?>", "", clean_text)
     clean_text = re.sub(r"\&.*?\;", "", clean_text)
@@ -27,7 +26,6 @@ def clean_refs(ref):
     clean_text = re.sub(r"\.*?", "", clean_text)
     clean_text = re.sub(r"\-.*?", "", clean_text)
     clean_text = re.sub(r"[\[|\]]", "", clean_text)
-    
     return clean_text
 
 def get_stopwords():
@@ -127,7 +125,7 @@ def get_proc_refs_info(doi, refs):
     total_ref_length = sum(map(len,refs.values()))
     refs_info = {"DOI": doi, "token_vocabulary": None, "token_frac_refs": None,"total_processed_ref_len": total_ref_length, "cleaned_references_length": None}
     [tokens, cleaned_ref_count] = get_tokens(doi, refs)
-    if tokens:
+    if tokens and cleaned_ref_count >= 25:
         word_count_info = count_tokens(doi, cleaned_ref_count, tokens)
         refs_info.update(word_count_info)
     return refs_info
@@ -174,11 +172,14 @@ def get_refs(contents):
             authors = None
             if author:
                 authors = [get_authors([x.get('family', None), x.get('given', None)]) for x in author]
+            issn = contents['issn-type'] if 'issn-type' in contents else [{"value": None, "type": None}]
             data = {
                 "DOI": contents["DOI"],
                 "type": contents.get("type", None),
                 "author": authors,
                 "title": title,
+                "issn": issn,
+                "member": contents.get("member", None),
                 "ref_count": contents.get("reference-count", None),
                 "proc_ref_ptge": processable_ref_count_percentage,
                 "proc_refs": processable_refs,
@@ -216,6 +217,8 @@ def get_values(row):
     v['title'] = row['title']
     v['proc_refs'] = row['proc_refs']
     v['flag'] = "No"
+    v['issn'] = row['issn']
+    v['member'] = row['member']
     if v['author']:
         tokens = v['token_vocabulary']
         flag = author_flag(doi, tokens, v['author'])
@@ -262,9 +265,12 @@ schema = StructType(
         StructField("work_type", StringType(), True),
         StructField("author", ArrayType(StringType()), True),
         StructField("flag", StringType(), True),
+        StructField("member", StringType(), True),
+        StructField("issn", ArrayType(MapType(StringType(), StringType(), True))),
         StructField("title", StringType(), True)
     ]
 )
 token_count_dataframe = spark.createDataFrame(results, schema=schema)
-parquet_filename = f"{output_sub_dir}.parquet"
+#parquet_filename = f"{output_sub_dir}.parquet"
+parquet_filename = "06_21.parquet"
 token_count_dataframe.write.parquet(parquet_filename)

@@ -271,6 +271,5 @@ schema = StructType(
     ]
 )
 token_count_dataframe = spark.createDataFrame(results, schema=schema)
-#parquet_filename = f"{output_sub_dir}.parquet"
-parquet_filename = "06_21.parquet"
+parquet_filename = f"{output_sub_dir}.parquet"
 token_count_dataframe.write.parquet(parquet_filename)

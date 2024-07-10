@@ -77,16 +77,24 @@ def get_stopwords():
     return all_stopwords
 
 def get_max_word(doi, words):
-    max_value = 0
-    keys = list(words.keys())
-    values = list(words.values())
-    try:
-        max_value = max(values)
-        indices = list(np.where(np.array(values) == max(values)))[0]
-        words = list(map(lambda x: keys[x], indices))
-    except ValueError as ve:
-        print(f"Error in max: for {doi}: word_dict: {words}. EXCEPTION : {ve.args[0]}")
-    return [max_value, words]
+    # sorting dictionary of words and their reference count and token count in descending order
+    sorted_word_dict = dict(sorted(words.items(), key=lambda item: (item[1]['reference_count'], item[1]['token_count']), reverse=True))
+    # the highest reference count and token count will be the first n elements
+    # in the following format:
+    # [('a', {'token_count': 5, 'reference_count': 3}),
+    #  ('test', {'token_count': 5, 'reference_count': 3}),
+    #  ('str', {'token_count': 4, 'reference_count': 2})]
+    process_sorted_word_list = list(sorted_word_dict.items())
+    # getting the max token and ref count
+    # it will be the first element as it is sorted by descending order
+    max_token_count = process_sorted_word_list[0][1]['token_count']
+    max_reference_count = process_sorted_word_list[0][1]['reference_count']
+    max_occurring_word = []
+    for el in process_sorted_word_list:
+        if el[1]['token_count'] == max_token_count and el[1]['reference_count'] == max_reference_count:
+            max_occurring_word.append(el[0])
+    return max_occurring_word
+
     
 def get_tokens(doi, refs):
     clean_text = {}
@@ -99,9 +107,11 @@ def get_tokens(doi, refs):
         clean_text[ref_type] = [clean_refs(x) for x in reference_values]
         clean_text[ref_type] = [x for x in clean_text[ref_type] if re.findall(split_by,x)]
         for text in clean_text[ref_type]:
-            tokens[ref_type].extend(re.findall(split_by, text))
-        if ref_type == "unstructured":
-            tokens[ref_type] = [t for t in tokens[ref_type] if t.lower() not in all_stopwords]
+            tokenized = re.findall(split_by, text)
+            tokens[ref_type].extend([{"tokens": tokenized, "reference": text}])
+            if ref_type == "unstructured":
+                index = len(tokens[ref_type]) - 1
+                tokens[ref_type][index]['tokens'] = [t for t in tokenized if t.lower() not in all_stopwords]
     cleaned_ref_count = sum(map(len,clean_text.values()))
     if tokens:
         for v in tokens.values():
@@ -110,16 +120,24 @@ def get_tokens(doi, refs):
 
 def count_tokens(doi, ref_length, tokens):
     words = {}
-    for index, t in enumerate(tokens):
+    for i in tokens:
+        # this contains the token as a key and its count as the value
+        token_count_info = {x: i['tokens'].count(x) for x in i['tokens']}
+        counted_tokens = list(token_count_info.keys())
         keys = list(words.keys())
-        if len(keys) == 0 or t not in keys:
-            first_count = index
-            words[t] = 1
-        elif (t in keys) and (index != first_count):
-            words[t] = words[t] + 1
-    [value, calculated_words] = get_max_word(doi, words)
-    frac_refs = value/ref_length
-    return {"token_vocabulary": calculated_words, "token_frac_refs": frac_refs, "cleaned_references_length": ref_length}
+        existing_tokens = set(keys).intersection(counted_tokens)
+        token_not_in_word_list = set(counted_tokens) - set(keys)
+        if token_not_in_word_list:
+            for t in token_not_in_word_list:
+                words[t] = {"token_count": token_count_info[t], "reference_count": 1}
+        if existing_tokens:
+            for t in existing_tokens:
+                words[t]['token_count'] = words[t]['token_count'] + token_count_info[t]
+                words[t]['reference_count'] = words[t]['reference_count'] + 1
+    max_occurring_word = get_max_word(doi, words)
+    reference_count = words[max_occurring_word[0]]['reference_count']
+    frac_refs = reference_count/ref_length
+    return {"token_vocabulary": max_occurring_word, "token_frac_refs": frac_refs, "cleaned_references_length": ref_length}
 
 def get_proc_refs_info(doi, refs):
     total_ref_length = sum(map(len,refs.values()))
@@ -225,7 +243,6 @@ def get_values(row):
         v.update(flag)
     return v
 
-
 def get_sub_dir(OUTPUT):
     now = datetime.now()
     dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.minute}_{now.second}"
@@ -242,17 +259,13 @@ all_data = spark.sparkContext.textFile(
     "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/",
     minPartitions=1000,
 )
-'''
-all_data = spark.sparkContext.textFile(
-    "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/part0.jsonl",
-    minPartitions=1000,
-)'''
+
 all_data = all_data.map(lambda r: json.loads(r))
 transformed_data = all_data.map(lambda d: process_record(d))
 transformed_data = transformed_data.filter(lambda d: d)
 results = transformed_data.map(lambda r: get_values(r))
 results = results.filter(
-    lambda r: r["token_frac_refs"] and r["token_frac_refs"] >= 0.35
+    lambda r: r["token_frac_refs"] and r["token_frac_refs"] >= 0.50
 )
 
 schema = StructType(

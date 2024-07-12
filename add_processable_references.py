@@ -1,6 +1,5 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, FloatType, MapType, IntegerType, StructField, StructType, ArrayType
-from sklearn.feature_extraction.text import CountVectorizer
 import numpy as np
 import json
 import sys
@@ -9,7 +8,6 @@ from stopwordsiso import stopwords
 import calendar
 from datetime import datetime
 from bs4 import BeautifulSoup
-import unicodedata
 
 input = sys.argv[1]
 output = sys.argv[2]
@@ -20,7 +18,7 @@ def clean_refs(ref):
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
     clean_text = re.sub(r"<.*?>", "", clean_text)
     clean_text = re.sub(r"\&.*?\;", "", clean_text)
-    clean_text = re.sub(r"http.*?\s", "", clean_text)
+    clean_text = re.sub(r"http\S+", "", clean_text)
     clean_text = re.sub(r"\d+", "", clean_text)
     clean_text = re.sub(r"_+", "", clean_text)
     clean_text = re.sub(r"\.*?", "", clean_text)
@@ -32,7 +30,9 @@ def get_stopwords():
     months = [x.lower() for x in list(calendar.month_name)[1:]]
     eng_stopwords = stopwords("en")
     domain_stopwords = [
+        "https",
         "book",
+        "vgl",
         "last",
         "em",
         "accessed",
@@ -71,10 +71,26 @@ def get_stopwords():
         "cited",
         "ref",
         "vol",
-        "rev"
+        "rev",
+        "magtechrefsourc", 
+        "span",
+        "referans",
+        "title",
+        "bibitem",
+        "https",
+        "reference",
+        "class",
+        "comatyponpdfplu", 
+        "lusxmlimplAut", 
+        "sinternalmodelp"
     ]
     all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months
     return all_stopwords
+
+def remove_common_author_strings():
+    # these are common strings that seem to occur in author fields
+    tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplAut", "sinternalmodelp"]
+    return tokens
 
 def get_max_word(doi, words):
     # sorting dictionary of words and their reference count and token count in descending order
@@ -102,6 +118,7 @@ def get_tokens(doi, refs):
     all_tokens = []
     split_by = r'\w{2,15}'
     all_stopwords = get_stopwords() if 'unstructured' in refs.keys() else None
+    common_author_strings = remove_common_author_strings() if 'authors' in refs.keys() else None
     for ref_type, reference_values in refs.items():
         tokens[ref_type] = []
         clean_text[ref_type] = [clean_refs(x) for x in reference_values]
@@ -109,9 +126,11 @@ def get_tokens(doi, refs):
         for text in clean_text[ref_type]:
             tokenized = re.findall(split_by, text)
             tokens[ref_type].extend([{"tokens": tokenized, "reference": text}])
+            index = len(tokens[ref_type]) - 1
             if ref_type == "unstructured":
-                index = len(tokens[ref_type]) - 1
                 tokens[ref_type][index]['tokens'] = [t for t in tokenized if t.lower() not in all_stopwords]
+            elif ref_type == "authors":
+                tokens[ref_type][index]['tokens'] = [t for t in tokenized if t.lower() not in common_author_strings]
     cleaned_ref_count = sum(map(len,clean_text.values()))
     if tokens:
         for v in tokens.values():
@@ -120,6 +139,8 @@ def get_tokens(doi, refs):
 
 def count_tokens(doi, ref_length, tokens):
     words = {}
+    max_occurring_word = []
+    frac_refs = 0.00
     for i in tokens:
         # this contains the token as a key and its count as the value
         token_count_info = {x: i['tokens'].count(x) for x in i['tokens']}
@@ -134,9 +155,12 @@ def count_tokens(doi, ref_length, tokens):
             for t in existing_tokens:
                 words[t]['token_count'] = words[t]['token_count'] + token_count_info[t]
                 words[t]['reference_count'] = words[t]['reference_count'] + 1
-    max_occurring_word = get_max_word(doi, words)
-    reference_count = words[max_occurring_word[0]]['reference_count']
-    frac_refs = reference_count/ref_length
+    if words: 
+        max_occurring_word = get_max_word(doi, words)
+        reference_count = words[max_occurring_word[0]]['reference_count']
+        frac_refs = reference_count/ref_length
+    else:
+        print(f"{doi} did not return any tokens")
     return {"token_vocabulary": max_occurring_word, "token_frac_refs": frac_refs, "cleaned_references_length": ref_length}
 
 def get_proc_refs_info(doi, refs):
@@ -149,6 +173,29 @@ def get_proc_refs_info(doi, refs):
     return refs_info
 
 def get_processable_references(reference):
+    processable_references = {}
+    authors = []
+    unstructured = []
+    for x in reference:
+        if "unstructured" in x:
+            removed_html_ref = BeautifulSoup(x["unstructured"]).get_text()
+            # get the first 50 or fewer characters from unstructured
+            cleaned = clean_refs(removed_html_ref[:50])
+            unstructured.append(cleaned)
+        elif "author" in x:
+            removed_html_author = BeautifulSoup(x["author"]).get_text()
+            authors.append(removed_html_author)
+    if unstructured:
+        unstructured = list(filter(lambda x: re.findall(r"\w{2,15}", x), unstructured))
+        processable_references["unstructured"] = unstructured
+    if authors:
+        authors = list(
+            filter(lambda x: re.findall(r"\w{2,15}", x), authors))
+        processable_references["authors"] = authors
+    processable_ref_count = len(authors) + len(unstructured)
+    return processable_ref_count, processable_references
+
+def get_processable_references2(reference):
     processable_references = {}
     authors = []
     unstructured = []
@@ -256,7 +303,7 @@ spark = SparkSession.builder.config(
 output_sub_dir = get_sub_dir(OUTPUT)
 
 all_data = spark.sparkContext.textFile(
-    "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-02/",
+    "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-06/",
     minPartitions=1000,
 )
 

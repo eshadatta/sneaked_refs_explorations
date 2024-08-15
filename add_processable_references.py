@@ -9,12 +9,14 @@ import calendar
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-
-# get unnecessary tokens file
-# get countries file - for consistency sake
 input = sys.argv[1]
 output = sys.argv[2]
+# ignore tokens is a file that contains tokens
+# found in earlier iterations of this processing
+# which are irrelevant data
 ignore_tokens = sys.argv[3]
+# in earlier processing, countries were found in the data
+# so in pre-processing of this data, countries are being removed
 ignore_countries = sys.argv[4]
 INPUT = input
 OUTPUT = output

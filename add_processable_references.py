@@ -9,6 +9,9 @@ import calendar
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+
+# get unnecessary tokens file
+# get countries file - for consistency sake
 input = sys.argv[1]
 output = sys.argv[2]
 INPUT = input
@@ -92,7 +95,7 @@ def remove_common_author_strings():
     tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplAut", "sinternalmodelp"]
     return tokens
 
-def get_max_word(doi, words):
+def get_max_word(words):
     # sorting dictionary of words and their reference count and token count in descending order
     sorted_word_dict = dict(sorted(words.items(), key=lambda item: (item[1]['reference_count'], item[1]['token_count']), reverse=True))
     # the highest reference count and token count will be the first n elements
@@ -111,8 +114,14 @@ def get_max_word(doi, words):
             max_occurring_word.append(el[0])
     return max_occurring_word
 
+
+def get_ref_len(record):
+    ref_count = 0
+    if "reference" in record.keys():
+        ref_count = len(record["reference"])
+    return ref_count
     
-def get_tokens(doi, refs):
+def get_tokens(refs):
     clean_text = {}
     tokens = {}
     all_tokens = []
@@ -156,7 +165,7 @@ def count_tokens(doi, ref_length, tokens):
                 words[t]['token_count'] = words[t]['token_count'] + token_count_info[t]
                 words[t]['reference_count'] = words[t]['reference_count'] + 1
     if words: 
-        max_occurring_word = get_max_word(doi, words)
+        max_occurring_word = get_max_word(words)
         reference_count = words[max_occurring_word[0]]['reference_count']
         frac_refs = reference_count/ref_length
     else:
@@ -166,7 +175,7 @@ def count_tokens(doi, ref_length, tokens):
 def get_proc_refs_info(doi, refs):
     total_ref_length = sum(map(len,refs.values()))
     refs_info = {"DOI": doi, "token_vocabulary": None, "token_frac_refs": None,"total_processed_ref_len": total_ref_length, "cleaned_references_length": None}
-    [tokens, cleaned_ref_count] = get_tokens(doi, refs)
+    [tokens, cleaned_ref_count] = get_tokens(refs)
     if tokens and cleaned_ref_count >= 25:
         word_count_info = count_tokens(doi, cleaned_ref_count, tokens)
         refs_info.update(word_count_info)
@@ -224,7 +233,7 @@ def get_authors(authors):
     authors = ", ".join(authors)
     return authors
 
-def get_refs(contents):
+def get_refs(contents, ref_count):
     data = {}
     proc_ref_count, processable_refs = get_processable_references(contents["reference"])
     if proc_ref_count >= 25:
@@ -248,6 +257,7 @@ def get_refs(contents):
                 "ref_count": contents.get("reference-count", None),
                 "proc_ref_ptge": processable_ref_count_percentage,
                 "proc_refs": processable_refs,
+                "total_reference_length": ref_count
             }
     return data
 
@@ -257,8 +267,9 @@ def process_record(contents):
     if "reference" in contents.keys():
         ref_count = len(contents["reference"])
     if ref_count > 25:
-        data = get_refs(contents)
+        data = get_refs(contents, ref_count)
     return data
+
 
 def author_flag(doi, vocabulary, authors):
     info = {"flag": "No"}
@@ -281,6 +292,7 @@ def get_values(row):
     v['author'] = row['author']
     v['title'] = row['title']
     v['proc_refs'] = row['proc_refs']
+    v['total_reference_length'] = row['total_reference_length']
     v['flag'] = "No"
     v['issn'] = row['issn']
     v['member'] = row['member']
@@ -294,7 +306,6 @@ def get_sub_dir(OUTPUT):
     now = datetime.now()
     dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.minute}_{now.second}"
     return dir_name
-
 
 spark = SparkSession.builder.config(
     "spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.8.5"
@@ -322,6 +333,7 @@ schema = StructType(
         StructField("token_frac_refs", FloatType(), True),
         StructField("total_processed_ref_len", IntegerType(), True),
         StructField("cleaned_references_length", IntegerType(), True),
+        StructField("total_reference_length", IntegerType(), False),
         StructField("work_type", StringType(), True),
         StructField("author", ArrayType(StringType()), True),
         StructField("flag", StringType(), True),

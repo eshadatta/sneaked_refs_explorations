@@ -14,8 +14,28 @@ from bs4 import BeautifulSoup
 # get countries file - for consistency sake
 input = sys.argv[1]
 output = sys.argv[2]
+ignore_tokens = sys.argv[3]
+ignore_countries = sys.argv[4]
 INPUT = input
 OUTPUT = output
+
+def read_file(f):
+    data = {}
+    try:
+        with open(f, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        print("ERROR: ", e)
+    return data
+
+def get_tokens_data():
+    unwanted_tokens = read_file(ignore_tokens)
+    stopword_countries = read_file(ignore_countries)
+    unwanted_tokens = [x.lower() for x in unwanted_tokens['unwanted_tokens']]
+    stopword_countries = [x.lower() for x in stopword_countries['countries']]
+    stopword_tokens = list(set(unwanted_tokens)) + stopword_countries
+    return stopword_tokens
+
 
 def clean_refs(ref):
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
@@ -32,6 +52,7 @@ def clean_refs(ref):
 def get_stopwords():
     months = [x.lower() for x in list(calendar.month_name)[1:]]
     eng_stopwords = stopwords("en")
+    additional_stopwords = get_tokens_data()
     domain_stopwords = [
         "https",
         "book",
@@ -84,15 +105,16 @@ def get_stopwords():
         "reference",
         "class",
         "comatyponpdfplu", 
-        "lusxmlimplAut", 
+        "lusxmlimplaut", 
         "sinternalmodelp"
     ]
-    all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months
+    all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("it")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months + additional_stopwords
     return all_stopwords
 
 def remove_common_author_strings():
+    additional_stopwords = get_tokens_data()
     # these are common strings that seem to occur in author fields
-    tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplAut", "sinternalmodelp"]
+    tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplaut", "sinternalmodelp"] + additional_stopwords
     return tokens
 
 def get_max_word(words):
@@ -113,13 +135,6 @@ def get_max_word(words):
         if el[1]['token_count'] == max_token_count and el[1]['reference_count'] == max_reference_count:
             max_occurring_word.append(el[0])
     return max_occurring_word
-
-
-def get_ref_len(record):
-    ref_count = 0
-    if "reference" in record.keys():
-        ref_count = len(record["reference"])
-    return ref_count
     
 def get_tokens(refs):
     clean_text = {}

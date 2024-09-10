@@ -1,6 +1,5 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StringType, FloatType, MapType, IntegerType, StructField, StructType, ArrayType
-import numpy as np
 import json
 import sys
 import re
@@ -15,29 +14,27 @@ output = sys.argv[2]
 # found in earlier iterations of this processing
 # which are irrelevant data
 ignore_tokens = sys.argv[3]
-# in earlier processing, countries were found in the data
+# in earlier processing, countries were found in most occurring tokens
 # so in pre-processing of this data, countries are being removed
 ignore_countries = sys.argv[4]
 INPUT = input
 OUTPUT = output
 
-def read_file(f):
-    data = {}
-    try:
-        with open(f, 'r') as f:
-            data = json.load(f)
-    except Exception as e:
-        print("ERROR: ", e)
-    return data
+spark = SparkSession.builder.config(
+    "spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.8.5"
+).getOrCreate()
 
-def get_tokens_data():
-    unwanted_tokens = read_file(ignore_tokens)
-    stopword_countries = read_file(ignore_countries)
-    unwanted_tokens = [x.lower() for x in unwanted_tokens['unwanted_tokens']]
-    stopword_countries = [x.lower() for x in stopword_countries['countries']]
-    stopword_tokens = list(set(unwanted_tokens)) + stopword_countries
-    return stopword_tokens
-
+unwanted_tokens = spark.sparkContext.textFile(ignore_tokens,
+    minPartitions=1000,
+)
+countries = spark.sparkContext.textFile(ignore_countries,
+    minPartitions=1000,
+)
+unwanted_tokens = unwanted_tokens.map(lambda r: json.loads(r))
+countries = countries.map(lambda r: json.loads(r))
+unwanted_tokens = [x.lower() for x in unwanted_tokens.take(1)[0]['unwanted_tokens']]
+countries = [x.lower() for x in countries.take(1)[0]['countries']]
+unwanted_data = unwanted_tokens + countries
 
 def clean_refs(ref):
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
@@ -54,7 +51,6 @@ def clean_refs(ref):
 def get_stopwords():
     months = [x.lower() for x in list(calendar.month_name)[1:]]
     eng_stopwords = stopwords("en")
-    additional_stopwords = get_tokens_data()
     domain_stopwords = [
         "https",
         "book",
@@ -108,15 +104,16 @@ def get_stopwords():
         "class",
         "comatyponpdfplu", 
         "lusxmlimplaut", 
-        "sinternalmodelp"
+        "sinternalmodelp",
+        "bauthor", 
+        "bsnm"
     ]
-    all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("it")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months + additional_stopwords
+    all_stopwords = list(eng_stopwords) + list(stopwords("es")) + list(stopwords("it")) + list(stopwords("de")) + list(stopwords("fr")) + list(stopwords("ru")) + domain_stopwords + months + unwanted_data
     return all_stopwords
 
 def remove_common_author_strings():
-    additional_stopwords = get_tokens_data()
     # these are common strings that seem to occur in author fields
-    tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplaut", "sinternalmodelp"] + additional_stopwords
+    tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplaut", "sinternalmodelp"] + unwanted_data
     return tokens
 
 def get_max_word(words):
@@ -221,29 +218,6 @@ def get_processable_references(reference):
     processable_ref_count = len(authors) + len(unstructured)
     return processable_ref_count, processable_references
 
-def get_processable_references2(reference):
-    processable_references = {}
-    authors = []
-    unstructured = []
-    for x in reference:
-        if "unstructured" in x:
-            removed_html_ref = BeautifulSoup(x["unstructured"]).get_text()
-            # get the first 50 or fewer characters from unstructured
-            cleaned = clean_refs(removed_html_ref[:50])
-            unstructured.append(cleaned)
-        elif "author" in x:
-            removed_html_author = BeautifulSoup(x["author"]).get_text()
-            authors.append(removed_html_author)
-    if unstructured:
-        unstructured = list(filter(lambda x: re.findall(r"\w{2,15}", x), unstructured))
-        processable_references["unstructured"] = unstructured
-    if authors:
-        authors = list(
-            filter(lambda x: re.findall(r"\w{2,15}", x), authors))
-        processable_references["authors"] = authors
-    processable_ref_count = len(authors) + len(unstructured)
-    return processable_ref_count, processable_references
-
 def get_authors(authors):
     authors = list(filter(lambda x: x, authors))
     authors = list(map(lambda x: x.lower(), authors))
@@ -260,6 +234,7 @@ def get_refs(contents, ref_count):
         if processable_ref_count_percentage >= 30:
             title = contents['title'][0] if 'title' in contents else None
             author = contents.get("author", None)
+            container_title = contents.get('container-title', None)
             authors = None
             if author:
                 authors = [get_authors([x.get('family', None), x.get('given', None)]) for x in author]
@@ -269,6 +244,7 @@ def get_refs(contents, ref_count):
                 "type": contents.get("type", None),
                 "author": authors,
                 "title": title,
+                "container_title": container_title,
                 "issn": issn,
                 "member": contents.get("member", None),
                 "ref_count": contents.get("reference-count", None),
@@ -308,6 +284,7 @@ def get_values(row):
     v['work_type'] = row['type']
     v['author'] = row['author']
     v['title'] = row['title']
+    v['container_title'] =row['container_title']
     v['proc_refs'] = row['proc_refs']
     v['total_reference_length'] = row['total_reference_length']
     v['flag'] = "No"
@@ -324,17 +301,11 @@ def get_sub_dir(OUTPUT):
     dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.minute}_{now.second}"
     return dir_name
 
-spark = SparkSession.builder.config(
-    "spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.8.5"
-).getOrCreate()
-
 output_sub_dir = get_sub_dir(OUTPUT)
-
 all_data = spark.sparkContext.textFile(
     "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-06/",
     minPartitions=1000,
 )
-
 all_data = all_data.map(lambda r: json.loads(r))
 transformed_data = all_data.map(lambda d: process_record(d))
 transformed_data = transformed_data.filter(lambda d: d)
@@ -342,7 +313,6 @@ results = transformed_data.map(lambda r: get_values(r))
 results = results.filter(
     lambda r: r["token_frac_refs"] and r["token_frac_refs"] >= 0.50
 )
-
 schema = StructType(
     [
         StructField("DOI", StringType(), False),
@@ -356,7 +326,8 @@ schema = StructType(
         StructField("flag", StringType(), True),
         StructField("member", StringType(), True),
         StructField("issn", ArrayType(MapType(StringType(), StringType(), True))),
-        StructField("title", StringType(), True)
+        StructField("title", StringType(), True),
+        StructField("container_title", ArrayType(StringType()), True)
     ]
 )
 token_count_dataframe = spark.createDataFrame(results, schema=schema)

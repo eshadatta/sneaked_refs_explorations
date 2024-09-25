@@ -24,9 +24,11 @@ spark = SparkSession.builder.config(
     "spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.8.5"
 ).getOrCreate()
 
+# tokens that do not need to be processed
 unwanted_tokens = spark.sparkContext.textFile(ignore_tokens,
     minPartitions=1000,
 )
+# adding countries to be removed from token counts
 countries = spark.sparkContext.textFile(ignore_countries,
     minPartitions=1000,
 )
@@ -37,6 +39,7 @@ countries = [x.lower() for x in countries.take(1)[0]['countries']]
 unwanted_data = unwanted_tokens + countries
 
 def clean_refs(ref):
+    '''scrubbing references of extraneous characters'''
     clean_text = re.sub(r"doi\:.*?\s", "", ref)
     clean_text = re.sub(r"<.*?>", "", clean_text)
     clean_text = re.sub(r"\&.*?\;", "", clean_text)
@@ -49,6 +52,7 @@ def clean_refs(ref):
     return clean_text
 
 def get_stopwords():
+    '''additional stopwords'''
     months = [x.lower() for x in list(calendar.month_name)[1:]]
     eng_stopwords = stopwords("en")
     domain_stopwords = [
@@ -112,11 +116,12 @@ def get_stopwords():
     return all_stopwords
 
 def remove_common_author_strings():
-    # these are common strings that seem to occur in author fields
+    '''removing common strings that occur within the author field'''
     tokens = ["and", "vgl", "et", "al", "magtechrefsourc", "span","referans","title","bibitem","https","reference","class","comatyponpdfplu", "lusxmlimplaut", "sinternalmodelp"] + unwanted_data
     return tokens
 
 def get_max_word(words):
+    '''getting the max count of the word or words out of all the token counts'''
     # sorting dictionary of words and their reference count and token count in descending order
     sorted_word_dict = dict(sorted(words.items(), key=lambda item: (item[1]['reference_count'], item[1]['token_count']), reverse=True))
     # the highest reference count and token count will be the first n elements
@@ -136,6 +141,7 @@ def get_max_word(words):
     return max_occurring_word
     
 def get_tokens(refs):
+    '''tokenizing and cleaning the data from references and/or author fields'''
     clean_text = {}
     tokens = {}
     all_tokens = []
@@ -161,6 +167,7 @@ def get_tokens(refs):
     return [all_tokens, cleaned_ref_count]
 
 def count_tokens(doi, ref_length, tokens):
+    '''counting the first occurrence of the token per reference'''
     words = {}
     max_occurring_word = []
     frac_refs = 0.00
@@ -187,6 +194,7 @@ def count_tokens(doi, ref_length, tokens):
     return {"token_vocabulary": max_occurring_word, "token_frac_refs": frac_refs, "cleaned_references_length": ref_length}
 
 def get_proc_refs_info(doi, refs):
+    '''data for all the processed references'''
     total_ref_length = sum(map(len,refs.values()))
     refs_info = {"DOI": doi, "token_vocabulary": None, "token_frac_refs": None,"total_processed_ref_len": total_ref_length, "cleaned_references_length": None}
     [tokens, cleaned_ref_count] = get_tokens(refs)
@@ -196,6 +204,7 @@ def get_proc_refs_info(doi, refs):
     return refs_info
 
 def get_processable_references(reference):
+    '''references that can be processed'''
     processable_references = {}
     authors = []
     unstructured = []
@@ -219,12 +228,14 @@ def get_processable_references(reference):
     return processable_ref_count, processable_references
 
 def get_authors(authors):
+    '''authors from the author field'''
     authors = list(filter(lambda x: x, authors))
     authors = list(map(lambda x: x.lower(), authors))
     authors = ", ".join(authors)
     return authors
 
 def get_refs(contents, ref_count):
+    '''unstructured references or authors'''
     data = {}
     proc_ref_count, processable_refs = get_processable_references(contents["reference"])
     if proc_ref_count >= 25:
@@ -255,6 +266,7 @@ def get_refs(contents, ref_count):
     return data
 
 def process_record(contents):
+    '''checks if there are greater than 25 references and processes them'''
     data = {}
     ref_count = 0
     if "reference" in contents.keys():
@@ -265,6 +277,7 @@ def process_record(contents):
 
 
 def author_flag(doi, vocabulary, authors):
+    '''checks to see if token matches any of the author tokens'''
     info = {"flag": "No"}
     if isinstance(vocabulary, list):
         process_authors = ",".join(authors)
@@ -278,6 +291,7 @@ def author_flag(doi, vocabulary, authors):
     return info
 
 def get_values(row):
+    '''collating all the data together'''
     doi = row["DOI"]
     refs = row["proc_refs"]
     v = get_proc_refs_info(doi, refs)
@@ -297,22 +311,35 @@ def get_values(row):
     return v
 
 def get_sub_dir(OUTPUT):
+    '''timestamped sub directory for output'''
     now = datetime.now()
     dir_name = f"{OUTPUT}/{now.year}_{now.month}_{now.day}T{now.hour}_{now.minute}_{now.second}"
     return dir_name
 
 output_sub_dir = get_sub_dir(OUTPUT)
+# reading data from the snapshot files
 all_data = spark.sparkContext.textFile(
     "s3://outputs-private.research.crossref.org/snapshot-jsonl/snapshot-24-06/",
     minPartitions=1000,
 )
+
+# get json records from snapshot
 all_data = all_data.map(lambda r: json.loads(r))
+
+# processes record
 transformed_data = all_data.map(lambda d: process_record(d))
+
+# filters out empty values
 transformed_data = transformed_data.filter(lambda d: d)
+
+# collates all the data
 results = transformed_data.map(lambda r: get_values(r))
+
+# keeps data that has a max token that occurs in 50% or higher of the references
 results = results.filter(
     lambda r: r["token_frac_refs"] and r["token_frac_refs"] >= 0.50
 )
+
 schema = StructType(
     [
         StructField("DOI", StringType(), False),
@@ -330,6 +357,8 @@ schema = StructType(
         StructField("container_title", ArrayType(StringType()), True)
     ]
 )
+
+# creates a dataframe and outputs it to a parquet file
 token_count_dataframe = spark.createDataFrame(results, schema=schema)
 parquet_filename = f"{output_sub_dir}.parquet"
 token_count_dataframe.write.parquet(parquet_filename)
